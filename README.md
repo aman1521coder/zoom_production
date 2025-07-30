@@ -213,4 +213,4 @@ Set your Zoom webhook URL to:
 https://aizoomai.com/api/webhooks/zoom
 ```
 
-Your meeting automation platform is now complete with both backend and frontend! 🎉 
+Your meeting automation platform is now complete with both backend and frontend! 🎉
