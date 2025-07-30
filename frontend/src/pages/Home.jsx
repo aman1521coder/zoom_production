@@ -3,7 +3,9 @@ import { Video, Shield, Zap, ArrowRight } from 'lucide-react';
 
 const Home = () => {
   const handleLogin = () => {
-    window.location.href = 'https://aizoomai.com/api/auth/zoom';
+    const apiUrl = import.meta.env.VITE_API_URL || 'https://aizoomai.com/api';
+    
+    window.location.href = `${apiUrl}/auth/zoom`;
   };
 
   return (

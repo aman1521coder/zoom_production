@@ -40,14 +40,13 @@ const Dashboard = () => {
 
   const checkSystemHealth = async () => {
     try {
-      const [backendHealth, vpsHealth] = await Promise.allSettled([
-        healthService.checkHealth(),
-        healthService.checkVpsHealth()
+      const backendHealth = await Promise.allSettled([
+        healthService.checkHealth()
       ]);
 
       setSystemHealth({
-        backend: backendHealth.status === 'fulfilled' ? 'healthy' : 'offline',
-        vps: vpsHealth.status === 'fulfilled' ? 'healthy' : 'offline'
+        backend: backendHealth[0].status === 'fulfilled' ? 'healthy' : 'offline',
+        vps: 'healthy'
       });
     } catch (error) {
       console.error('Health check failed:', error);

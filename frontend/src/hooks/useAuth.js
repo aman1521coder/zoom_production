@@ -5,7 +5,7 @@ const useAuth = () => {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const initializeAuth = () => {
+    const initializeAuth = async () => {
       const urlParams = new URLSearchParams(window.location.search);
       const token = urlParams.get('token');
       const userParam = urlParams.get('user');
@@ -20,18 +20,21 @@ const useAuth = () => {
         } catch (error) {
           console.error('Error parsing user data:', error);
         }
+        setLoading(false);
       } else {
         const existingToken = localStorage.getItem('authToken');
         if (existingToken) {
-          verifyToken(existingToken);
+          await verifyToken(existingToken);
         }
+        setLoading(false);
       }
-      setLoading(false);
     };
 
     const verifyToken = async (token) => {
       try {
-        const response = await fetch('https://aizoomai.com/api/auth/verify', {
+        const apiUrl = import.meta.env.VITE_API_URL || 'https://aizoomai.com/api';
+        
+        const response = await fetch(`${apiUrl}/auth/verify`, {
           headers: {
             'Authorization': `Bearer ${token}`,
             'Content-Type': 'application/json'

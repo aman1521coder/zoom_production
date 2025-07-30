@@ -63,7 +63,7 @@ router.get("/zoom/callback", async (req, res) => {
 
     const appToken = jwt.sign({ userId: user._id }, JWT_SECRET, { expiresIn: '7d' });
 
-    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
     const redirectUrl = `${frontendUrl}?token=${appToken}&user=${encodeURIComponent(JSON.stringify({
       id: user._id, 
       email: user.email, 

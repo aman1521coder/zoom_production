@@ -1,26 +1,10 @@
 import express from 'express';
 import WebhookHandler from '../services/WebhookHandler.js';
 import Meeting from '../models/Meeting.js';
-import { verifyToken } from '../utils/encryption.js';
 
 const router = express.Router();
 
-const authenticate = async (req, res, next) => {
-  try {
-    const token = req.header('Authorization')?.replace('Bearer ', '');
-    if (!token) {
-      return res.status(401).json({ error: 'Access denied' });
-    }
-
-    const decoded = await verifyToken(token);
-    req.user = decoded;
-    next();
-  } catch (error) {
-    res.status(401).json({ error: 'Invalid token' });
-  }
-};
-
-router.post('/join-by-link', authenticate, async (req, res) => {
+router.post('/join-by-link', async (req, res) => {
   try {
     const { invitationLink } = req.body;
     
@@ -30,7 +14,7 @@ router.post('/join-by-link', authenticate, async (req, res) => {
 
     const result = await WebhookHandler.handleBotJoinByLink(
       invitationLink, 
-      req.user.id
+      req.user._id
     );
 
     res.json(result);
@@ -39,10 +23,10 @@ router.post('/join-by-link', authenticate, async (req, res) => {
   }
 });
 
-router.get('/active', authenticate, async (req, res) => {
+router.get('/active', async (req, res) => {
   try {
     const meetings = await Meeting.find({
-      userId: req.user.id,
+      userId: req.user._id,
       status: { $in: ['recording', 'active'] }
     }).select('meetingId status recordingMethod startTime');
 
