@@ -27,6 +27,9 @@ api.interceptors.response.use(
     return Promise.reject(error);
   }
 );
+export const meetingService={
+  api
+}
 
 export const botService = {
   joinByLink: (invitationLink) =>
@@ -36,7 +39,7 @@ export const botService = {
     api.get('/bots/active'),
   
   stopBot: (meetingId) =>
-    api.post(`/bots/stop/${meetingId}`),
+    api.post(`/webhooks/stop-bot/${meetingId}`, { reason: 'manual_stop' }),
 };
 
 export const recordingService = {
@@ -59,14 +62,40 @@ export const transcriptService = {
   
   searchTranscripts: (query) =>
     api.get(`/transcripts/search?q=${encodeURIComponent(query)}`),
+  
+  deleteTranscript: (transcriptId) =>
+    api.delete(`/transcripts/${transcriptId}`),
 };
 
 export const healthService = {
   checkHealth: () =>
-    api.get('/health', { baseURL: 'https://aizoomai.com' }),
+    axios.get(`https://aizoomai.com/health`, { timeout: 5000 }),
   
-  checkVpsHealth: () =>
-    axios.get('http://147.93.119.85:3000/health'),
+  checkVpsHealth: async () => {
+    try {
+      // Try direct VPS connection first
+      const response = await axios.get('http://147.93.119.85:3000/health', { 
+        timeout: 5000,
+        validateStatus: (status) => status < 500 
+      });
+      return response;
+    } catch (error) {
+      // If CORS blocks direct access, use public backend proxy
+      try {
+        return await axios.get(`${API_BASE_URL}/vps-health`, { timeout: 5000 });
+      } catch (backendError) {
+        throw error; // Return original VPS error
+      }
+    }
+  },
+};
+
+export const vpsService = {
+  getBotStatus: (meetingId) =>
+    axios.get(`http://147.93.119.85:3000/status/${meetingId}`, { timeout: 5000 }),
+    
+  getActiveBots: () =>
+    axios.get('http://147.93.119.85:3000/bots', { timeout: 5000 }),
 };
 
 export default api; 

@@ -50,6 +50,9 @@ class TranscriptProcessor {
       );
 
       this.saveTranscriptFile(saved._id, transcriptionResult.text);
+      
+      // Backend doesn't use Redis (cPanel issue) - worker will handle caching
+      console.log('Transcription completed successfully for meetingId:', meetingId);
 
       return {
         success: true,
@@ -146,12 +149,14 @@ class TranscriptProcessor {
     }
   }
 
-  async getTranscript(meetingId, userId) {
+  async getTranscript(meetingId, userId = null) {
     try {
-      const transcript = await Transcript.findOne({
-        meetingId,
-        userId
-      }).populate('userId', 'email firstName lastName');
+      const query = { meetingId };
+      if (userId) {
+        query.userId = userId;
+      }
+      
+      const transcript = await Transcript.findOne(query).populate('userId', 'email firstName lastName');
 
       if (!transcript) {
         return { success: false, error: 'Transcript not found' };

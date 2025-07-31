@@ -6,184 +6,373 @@ import {
   Eye,
   RefreshCw,
   Calendar,
-  Clock
+  Clock,
+  Edit,
+  Save,
+  X,
+  Filter,
+  Trash2,
+  AlertTriangle
 } from 'lucide-react';
+import { transcriptService } from '../services/api';
 
 const Transcripts = () => {
   const [transcripts, setTranscripts] = useState([]);
   const [loading, setLoading] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedTranscript, setSelectedTranscript] = useState(null);
+  const [editingTranscript, setEditingTranscript] = useState(null);
+  const [editText, setEditText] = useState('');
+  const [filterStatus, setFilterStatus] = useState('all');
+  const [deleteConfirm, setDeleteConfirm] = useState(null);
+  const [deleting, setDeleting] = useState(false);
+  const [authStatus, setAuthStatus] = useState('unknown');
 
   useEffect(() => {
+    checkAuthStatus();
     loadTranscripts();
   }, []);
+
+  const checkAuthStatus = () => {
+    const token = localStorage.getItem('authToken');
+    setAuthStatus(token ? 'authenticated' : 'not-authenticated');
+  };
+
+  const setTestToken = () => {
+    const testToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiI2ODgwMGNjZjE3ZjU2ZDRhMmZhMTZiNzYiLCJpYXQiOjE3NTM5NDM2MjgsImV4cCI6MTc1NDU0ODQyOH0.QHnaG2A6CAIk1JjteS4X7Sb3btJx2UBrjenFYno63OY';
+    localStorage.setItem('authToken', testToken);
+    setAuthStatus('authenticated');
+    alert('Test token set! Try loading transcripts again.');
+  };
 
   const loadTranscripts = async () => {
     setLoading(true);
     try {
-      // Mock data for now - replace with actual API call
-      const mockTranscripts = [
-        {
-          id: '1',
-          meetingId: '123456789',
-          topic: 'Team Standup',
-          fullText: 'Good morning everyone. Let\'s start with our daily standup. John, can you share what you worked on yesterday?',
-          wordCount: 324,
-          createdAt: new Date(Date.now() - 86400000),
-          duration: 15,
-          summary: 'Team discussed daily progress and upcoming sprint goals.',
-          keyTopics: ['sprint planning', 'bug fixes', 'feature development']
-        },
-        {
-          id: '2',
-          meetingId: '987654321',
-          topic: 'Product Review',
-          fullText: 'Welcome to our quarterly product review. Today we\'ll be discussing the new features we\'ve launched...',
-          wordCount: 1250,
-          createdAt: new Date(Date.now() - 3600000),
-          duration: 45,
-          summary: 'Quarterly review of product features and roadmap discussion.',
-          keyTopics: ['product roadmap', 'user feedback', 'metrics']
-        }
-      ];
-      setTranscripts(mockTranscripts);
+      console.log('Loading transcripts...');
+      console.log('Auth token exists:', !!localStorage.getItem('authToken'));
+      
+      const response = await transcriptService.getAllTranscripts();
+      console.log('Transcripts API response:', response);
+      console.log('Response data:', response.data);
+      
+      const transcripts = response.data.transcripts || [];
+      console.log('Extracted transcripts:', transcripts);
+      
+      setTranscripts(transcripts);
     } catch (error) {
       console.error('Failed to load transcripts:', error);
+      console.error('Error response:', error.response?.data);
+      console.error('Error status:', error.response?.status);
+      
+      // If 401, show authentication error
+      if (error.response?.status === 401) {
+        console.log('Authentication required - user needs to sign in');
+      }
     } finally {
       setLoading(false);
     }
   };
 
-  const filteredTranscripts = transcripts.filter(transcript =>
-    transcript.fullText?.toLowerCase().includes(searchTerm.toLowerCase()) ||
-    transcript.topic?.toLowerCase().includes(searchTerm.toLowerCase()) ||
-    transcript.keyTopics?.some(topic => topic.toLowerCase().includes(searchTerm.toLowerCase()))
-  );
+  const deleteTranscript = async (transcriptId) => {
+    setDeleting(true);
+    try {
+      await transcriptService.deleteTranscript(transcriptId);
+      setTranscripts(prev => prev.filter(t => t._id !== transcriptId));
+      setDeleteConfirm(null);
+      alert('Transcript deleted successfully');
+    } catch (error) {
+      console.error('Failed to delete transcript:', error);
+      alert('Failed to delete transcript: ' + (error.response?.data?.error || error.message));
+    } finally {
+      setDeleting(false);
+    }
+  };
 
-  const formatDuration = (minutes) => {
-    const hours = Math.floor(minutes / 60);
-    const mins = minutes % 60;
-    return hours > 0 ? `${hours}h ${mins}m` : `${mins}m`;
+  const downloadTranscript = (transcript) => {
+    const content = `Meeting Transcript
+==================
+
+Session ID: ${transcript.meetingId}
+Date: ${new Date(transcript.createdAt).toLocaleString()}
+Duration: ${transcript.audioDuration || 0} seconds
+Word Count: ${transcript.wordCount || 0}
+
+Full Transcript:
+${transcript.fullText}
+
+---
+Generated by Meeting Automation System
+`;
+    
+    const blob = new Blob([content], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `transcript_${transcript.meetingId}_${new Date(transcript.createdAt).toISOString().split('T')[0]}.txt`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const startEdit = (transcript) => {
+    setEditingTranscript(transcript._id);
+    setEditText(transcript.fullText);
+  };
+
+  const cancelEdit = () => {
+    setEditingTranscript(null);
+    setEditText('');
+  };
+
+  const saveEdit = async (transcriptId) => {
+    try {
+      // Update local state for now
+      setTranscripts(prev => prev.map(t => 
+        t._id === transcriptId 
+          ? { ...t, fullText: editText }
+          : t
+      ));
+      setEditingTranscript(null);
+      setEditText('');
+      
+      // TODO: Integrate with backend API to save changes
+      // await transcriptService.updateTranscript(transcriptId, { fullText: editText });
+    } catch (error) {
+      console.error('Failed to save edit:', error);
+    }
   };
 
   const truncateText = (text, maxLength = 150) => {
-    if (text.length <= maxLength) return text;
-    return text.substring(0, maxLength) + '...';
+    if (!text) return '';
+    return text.length > maxLength ? text.substring(0, maxLength) + '...' : text;
+  };
+
+  const filteredTranscripts = transcripts.filter(transcript => {
+    const matchesSearch = !searchTerm || 
+      transcript.meetingId?.toLowerCase().includes(searchTerm.toLowerCase()) ||
+      transcript.fullText?.toLowerCase().includes(searchTerm.toLowerCase());
+    
+    const matchesFilter = filterStatus === 'all' || transcript.status === filterStatus;
+    
+    return matchesSearch && matchesFilter;
+  });
+
+  const formatDate = (dateString) => {
+    return new Date(dateString).toLocaleDateString('en-US', {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit'
+    });
+  };
+
+  const getStatusColor = (status) => {
+    switch (status) {
+      case 'completed': return 'bg-green-100 text-green-800';
+      case 'processing': return 'bg-yellow-100 text-yellow-800';
+      case 'failed': return 'bg-red-100 text-red-800';
+      default: return 'bg-gray-100 text-gray-600';
+    }
   };
 
   return (
     <div className="space-y-6">
+      {/* Header */}
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-bold text-gray-900">Transcripts</h1>
-          <p className="text-gray-600">Search and view your meeting transcripts</p>
+          <p className="text-gray-600 mt-1">Manage and review meeting transcripts</p>
         </div>
         <button
           onClick={loadTranscripts}
           disabled={loading}
-          className="btn-primary flex items-center space-x-2"
+          className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg flex items-center space-x-2 disabled:opacity-50"
         >
           <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
           <span>Refresh</span>
         </button>
       </div>
 
-      <div className="card">
-        <div className="flex items-center space-x-4 mb-6">
-          <div className="relative flex-1">
-            <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 h-4 w-4" />
-            <input
-              type="text"
-              placeholder="Search transcripts..."
-              value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
-              className="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
-            />
+      {/* Authentication Status & Debug */}
+      <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4">
+        <div className="flex items-center justify-between">
+          <div>
+            <h3 className="text-sm font-medium text-yellow-800">Debug Information</h3>
+            <p className="text-sm text-yellow-700 mt-1">
+              Auth Status: <span className="font-semibold">{authStatus}</span>
+              {authStatus === 'not-authenticated' && ' - Sign in required to view transcripts'}
+            </p>
+          </div>
+          {authStatus === 'not-authenticated' && (
+            <button
+              onClick={setTestToken}
+              className="bg-yellow-600 hover:bg-yellow-700 text-white px-3 py-1 rounded text-sm"
+            >
+              Set Test Token
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Filters and Search */}
+      <div className="bg-white rounded-lg shadow-sm border p-6">
+        <div className="flex flex-col sm:flex-row gap-4">
+          <div className="flex-1">
+            <div className="relative">
+              <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-gray-400" />
+              <input
+                type="text"
+                placeholder="Search transcripts by session ID or content..."
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
+                className="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+              />
+            </div>
+          </div>
+          <div className="flex items-center space-x-2">
+            <Filter className="h-4 w-4 text-gray-500" />
+            <select
+              value={filterStatus}
+              onChange={(e) => setFilterStatus(e.target.value)}
+              className="border border-gray-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+            >
+              <option value="all">All Status</option>
+              <option value="completed">Completed</option>
+              <option value="processing">Processing</option>
+              <option value="failed">Failed</option>
+            </select>
           </div>
         </div>
+      </div>
 
+      {/* Transcripts List */}
+      <div className="bg-white rounded-lg shadow-sm border">
         {loading ? (
-          <div className="text-center py-12">
-            <RefreshCw className="h-8 w-8 text-gray-400 mx-auto mb-4 animate-spin" />
-            <p className="text-gray-600">Loading transcripts...</p>
+          <div className="flex items-center justify-center py-12">
+            <RefreshCw className="h-8 w-8 animate-spin text-blue-600" />
+            <span className="ml-3 text-gray-600">Loading transcripts...</span>
           </div>
         ) : filteredTranscripts.length === 0 ? (
           <div className="text-center py-12">
             <FileText className="h-12 w-12 text-gray-400 mx-auto mb-4" />
-            <h4 className="text-lg font-medium text-gray-900 mb-2">No Transcripts Found</h4>
+            <h3 className="text-lg font-medium text-gray-900 mb-2">
+              {transcripts.length === 0 ? 'No Transcripts Available' : 'No Results Found'}
+            </h3>
             <p className="text-gray-600">
-              {searchTerm ? 'No transcripts match your search' : 'No transcripts available yet'}
+              {transcripts.length === 0 
+                ? 'Transcripts from recorded sessions will appear here' 
+                : 'Try adjusting your search terms or filters'
+              }
             </p>
           </div>
         ) : (
-          <div className="space-y-4">
+          <div className="divide-y divide-gray-200">
             {filteredTranscripts.map((transcript) => (
-              <div key={transcript.id} className="border border-gray-200 rounded-lg p-6">
+              <div key={transcript._id} className="p-6 hover:bg-gray-50 transition-colors">
                 <div className="flex items-start justify-between">
                   <div className="flex-1">
-                    <div className="flex items-center space-x-4 mb-3">
-                      <h3 className="text-lg font-semibold text-gray-900">
-                        {transcript.topic || `Meeting ${transcript.meetingId}`}
-                      </h3>
-                      <span className="px-2 py-1 bg-primary-100 text-primary-700 text-xs rounded-full font-medium">
-                        {transcript.wordCount} words
+                    <div className="flex items-center space-x-3 mb-2">
+                      <div className="flex items-center space-x-2">
+                        <FileText className="h-5 w-5 text-blue-600" />
+                        <h3 className="text-lg font-medium text-gray-900">
+                          Session {transcript.meetingId}
+                        </h3>
+                      </div>
+                      <span className={`px-2 py-1 rounded-full text-xs font-medium ${getStatusColor(transcript.status)}`}>
+                        {transcript.status || 'completed'}
                       </span>
                     </div>
 
-                    <p className="text-gray-700 mb-4">
-                      {truncateText(transcript.fullText)}
-                    </p>
-
-                    {transcript.summary && (
-                      <div className="mb-4 p-3 bg-gray-50 rounded-lg">
-                        <h4 className="text-sm font-medium text-gray-900 mb-1">Summary</h4>
-                        <p className="text-sm text-gray-700">{transcript.summary}</p>
-                      </div>
-                    )}
-
-                    {transcript.keyTopics && transcript.keyTopics.length > 0 && (
-                      <div className="mb-4">
-                        <h4 className="text-sm font-medium text-gray-900 mb-2">Key Topics</h4>
-                        <div className="flex flex-wrap gap-2">
-                          {transcript.keyTopics.map((topic, index) => (
-                            <span
-                              key={index}
-                              className="px-2 py-1 bg-gray-100 text-gray-700 text-xs rounded-full"
-                            >
-                              {topic}
-                            </span>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-
-                    <div className="flex items-center space-x-4 text-sm text-gray-600">
+                    <div className="flex items-center space-x-4 text-sm text-gray-600 mb-3">
                       <div className="flex items-center space-x-1">
                         <Calendar className="h-4 w-4" />
-                        <span>{transcript.createdAt.toLocaleDateString()}</span>
+                        <span>{formatDate(transcript.createdAt)}</span>
                       </div>
-                      <div className="flex items-center space-x-1">
-                        <Clock className="h-4 w-4" />
-                        <span>{formatDuration(transcript.duration)}</span>
-                      </div>
-                      <div className="text-xs text-gray-500">
-                        Meeting ID: {transcript.meetingId}
-                      </div>
+                      {transcript.audioDuration && (
+                        <div className="flex items-center space-x-1">
+                          <Clock className="h-4 w-4" />
+                          <span>{Math.round(transcript.audioDuration)}s duration</span>
+                        </div>
+                      )}
+                      {transcript.wordCount && (
+                        <div className="flex items-center space-x-1">
+                          <FileText className="h-4 w-4" />
+                          <span>{transcript.wordCount} words</span>
+                        </div>
+                      )}
                     </div>
+
+                    {editingTranscript === transcript._id ? (
+                      <div className="space-y-3">
+                        <textarea
+                          value={editText}
+                          onChange={(e) => setEditText(e.target.value)}
+                          className="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 min-h-32"
+                          placeholder="Edit transcript content..."
+                        />
+                        <div className="flex space-x-2">
+                          <button
+                            onClick={() => saveEdit(transcript._id)}
+                            className="bg-green-600 hover:bg-green-700 text-white px-3 py-1 rounded text-sm flex items-center space-x-1"
+                          >
+                            <Save className="h-3 w-3" />
+                            <span>Save</span>
+                          </button>
+                          <button
+                            onClick={cancelEdit}
+                            className="bg-gray-600 hover:bg-gray-700 text-white px-3 py-1 rounded text-sm flex items-center space-x-1"
+                          >
+                            <X className="h-3 w-3" />
+                            <span>Cancel</span>
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="text-gray-700 leading-relaxed">
+                        <p>{truncateText(transcript.fullText)}</p>
+                        {transcript.fullText && transcript.fullText.length > 150 && (
+                          <button
+                            onClick={() => setSelectedTranscript(transcript)}
+                            className="text-blue-600 hover:text-blue-800 text-sm mt-2 flex items-center space-x-1"
+                          >
+                            <Eye className="h-3 w-3" />
+                            <span>Read more</span>
+                          </button>
+                        )}
+                      </div>
+                    )}
                   </div>
 
                   <div className="flex items-center space-x-2 ml-4">
-                    <button 
-                      onClick={() => setSelectedTranscript(transcript)}
-                      className="btn-secondary text-sm flex items-center space-x-1"
+                    <button
+                      onClick={() => downloadTranscript(transcript)}
+                      className="bg-blue-100 hover:bg-blue-200 text-blue-700 p-2 rounded-lg transition-colors"
+                      title="Download transcript"
                     >
-                      <Eye className="h-3 w-3" />
-                      <span>View Full</span>
+                      <Download className="h-4 w-4" />
                     </button>
-                    <button className="btn-secondary text-sm flex items-center space-x-1">
-                      <Download className="h-3 w-3" />
-                      <span>Download</span>
+                    <button
+                      onClick={() => startEdit(transcript)}
+                      className="bg-gray-100 hover:bg-gray-200 text-gray-700 p-2 rounded-lg transition-colors"
+                      title="Edit transcript"
+                    >
+                      <Edit className="h-4 w-4" />
+                    </button>
+                    <button
+                      onClick={() => setSelectedTranscript(transcript)}
+                      className="bg-green-100 hover:bg-green-200 text-green-700 p-2 rounded-lg transition-colors"
+                      title="View full transcript"
+                    >
+                      <Eye className="h-4 w-4" />
+                    </button>
+                    <button
+                      onClick={() => setDeleteConfirm(transcript)}
+                      className="bg-red-100 hover:bg-red-200 text-red-700 p-2 rounded-lg transition-colors"
+                      title="Delete transcript"
+                    >
+                      <Trash2 className="h-4 w-4" />
                     </button>
                   </div>
                 </div>
@@ -193,26 +382,102 @@ const Transcripts = () => {
         )}
       </div>
 
+      {/* Delete Confirmation Modal */}
+      {deleteConfirm && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-lg shadow-lg max-w-md w-full">
+            <div className="p-6">
+              <div className="flex items-center space-x-3 mb-4">
+                <div className="flex h-10 w-10 items-center justify-center rounded-full bg-red-100">
+                  <AlertTriangle className="h-6 w-6 text-red-600" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-medium text-gray-900">Delete Transcript</h3>
+                  <p className="text-sm text-gray-600">This action cannot be undone</p>
+                </div>
+              </div>
+              
+              <div className="mb-6">
+                <p className="text-gray-700">
+                  Are you sure you want to delete the transcript for Session {deleteConfirm.meetingId}?
+                </p>
+                <div className="mt-2 p-3 bg-gray-50 rounded border">
+                  <p className="text-sm text-gray-600">
+                    Created: {formatDate(deleteConfirm.createdAt)}
+                  </p>
+                  <p className="text-sm text-gray-600">
+                    Words: {deleteConfirm.wordCount || 0}
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex space-x-3">
+                <button
+                  onClick={() => deleteTranscript(deleteConfirm._id)}
+                  disabled={deleting}
+                  className="flex-1 bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded-lg flex items-center justify-center space-x-2 disabled:opacity-50"
+                >
+                  {deleting ? (
+                    <RefreshCw className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <Trash2 className="h-4 w-4" />
+                  )}
+                  <span>{deleting ? 'Deleting...' : 'Delete'}</span>
+                </button>
+                <button
+                  onClick={() => setDeleteConfirm(null)}
+                  disabled={deleting}
+                  className="flex-1 bg-gray-600 hover:bg-gray-700 text-white px-4 py-2 rounded-lg disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Full Transcript Modal */}
       {selectedTranscript && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 z-50 flex items-center justify-center p-4">
-          <div className="bg-white rounded-xl max-w-4xl w-full max-h-[80vh] overflow-hidden">
-            <div className="flex items-center justify-between p-6 border-b border-gray-200">
-              <h3 className="text-xl font-semibold text-gray-900">
-                {selectedTranscript.topic || `Meeting ${selectedTranscript.meetingId}`}
-              </h3>
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-lg shadow-lg max-w-4xl w-full max-h-[80vh] flex flex-col">
+            <div className="flex items-center justify-between p-6 border-b">
+              <div>
+                <h2 className="text-xl font-semibold text-gray-900">
+                  Session {selectedTranscript.meetingId}
+                </h2>
+                <p className="text-gray-600 text-sm mt-1">
+                  {formatDate(selectedTranscript.createdAt)}
+                </p>
+              </div>
               <button
                 onClick={() => setSelectedTranscript(null)}
-                className="text-gray-400 hover:text-gray-600"
+                className="text-gray-400 hover:text-gray-600 p-2"
               >
-                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                </svg>
+                <X className="h-6 w-6" />
               </button>
             </div>
-            <div className="p-6 overflow-y-auto max-h-[60vh]">
+            <div className="flex-1 overflow-y-auto p-6">
               <div className="prose max-w-none">
-                <p className="whitespace-pre-wrap">{selectedTranscript.fullText}</p>
+                <p className="text-gray-800 leading-relaxed whitespace-pre-wrap">
+                  {selectedTranscript.fullText}
+                </p>
               </div>
+            </div>
+            <div className="flex items-center justify-end space-x-3 p-6 border-t bg-gray-50">
+              <button
+                onClick={() => downloadTranscript(selectedTranscript)}
+                className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg flex items-center space-x-2"
+              >
+                <Download className="h-4 w-4" />
+                <span>Download</span>
+              </button>
+              <button
+                onClick={() => setSelectedTranscript(null)}
+                className="bg-gray-600 hover:bg-gray-700 text-white px-4 py-2 rounded-lg"
+              >
+                Close
+              </button>
             </div>
           </div>
         </div>

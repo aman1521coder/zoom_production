@@ -28,7 +28,7 @@ const transcriptSchema = new mongoose.Schema({
   segments: [segmentSchema],
   language: {
     type: String,
-    default: 'en-US'
+    default: 'en'  // Use 'en' instead of 'en-US' for MongoDB text index compatibility
   },
   status: {
     type: String,
