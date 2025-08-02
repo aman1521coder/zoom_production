@@ -63,7 +63,9 @@ router.get("/zoom/callback", async (req, res) => {
 
     const appToken = jwt.sign({ userId: user._id }, JWT_SECRET, { expiresIn: '7d' });
 
-    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+    const frontendUrl = process.env.FRONTEND_URL || 'https://aizoomai.com';
+    console.log('DEBUG: FRONTEND_URL env var:', process.env.FRONTEND_URL);
+    console.log('DEBUG: Final frontendUrl:', frontendUrl);
     const redirectUrl = `${frontendUrl}?token=${appToken}&user=${encodeURIComponent(JSON.stringify({
       id: user._id, 
       email: user.email, 
@@ -106,7 +108,8 @@ router.get("/verify", async (req, res) => {
         id: user._id,
         email: user.email,
         firstName: user.firstName,
-        lastName: user.lastName
+        lastName: user.lastName,
+        zoomId: user.zoomId
       }
     });
 
@@ -116,6 +119,19 @@ router.get("/verify", async (req, res) => {
       success: false, 
       message: 'Invalid token' 
     });
+  }
+});
+
+router.get("/debug-users", async (req, res) => {
+  try {
+    const users = await User.find({}, 'email firstName zoomId').limit(10);
+    res.json({
+      success: true,
+      users: users,
+      totalUsers: users.length
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 

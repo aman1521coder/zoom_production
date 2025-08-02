@@ -8,6 +8,7 @@ import webhookRoutes from './routes/webhooks.js';
 import recordingRoutes from './routes/recordings.js';
 import botRoutes from './routes/bots.js';
 import transcriptRoutes from './routes/transcripts.js';
+import maintenanceRoutes from './routes/maintenance.js';
 import { authenticate } from './middleware/auth.js';
 
 dotenv.config({ path: './config.env' });
@@ -20,7 +21,7 @@ mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/zoom-ai-b
   .catch(err => console.error('MongoDB Error:', err));
 
 app.use(cors({
-  origin: '*', // Allow all origins for debugging
+  origin: ['https://aizoomai.com', 'https://www.aizoomai.com', 'http://localhost:3000'],
   credentials: true
 }));
 app.use(express.json());
@@ -45,9 +46,10 @@ app.get('/api/health', (req, res) => {
 
 app.use('/api/auth', authRoutes);
 app.use('/api/webhooks', webhookRoutes);
-app.use('/api/recordings', recordingRoutes);  
+app.use('/api/recordings', recordingRoutes);
 app.use('/api/bots', authenticate, botRoutes);
 app.use('/api/transcripts', authenticate, transcriptRoutes);
+app.use('/api/maintenance', maintenanceRoutes);
 
 // Debug endpoint to verify API routing
 app.get('/api/debug', (req, res) => {
@@ -103,6 +105,8 @@ app.use((err, req, res, next) => {
 
 app.listen(PORT, () => {
   console.log('Server running on port', PORT);
+  console.log('🔌 API-only backend ready');
+  console.log('📡 API routes available at: /api/*');
 });
 
 export default app;

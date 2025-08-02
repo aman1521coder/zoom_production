@@ -213,6 +213,237 @@ const redis = new RedisManager();
 const activeBots = new Map();
 const RECORDINGS_DIR = process.env.RECORDINGS_DIR || path.join(__dirname, 'recordings');
 
+// PERFORMANCE & CONCURRENCY OPTIMIZATIONS
+const MAX_CONCURRENT_BOTS = parseInt(process.env.MAX_CONCURRENT_BOTS) || 10;
+const MAX_BROWSER_INSTANCES = parseInt(process.env.MAX_BROWSER_INSTANCES) || 5;
+const MEMORY_LIMIT_MB = parseInt(process.env.MEMORY_LIMIT_MB) || 4096;
+const browserUsage = new Map();
+let nextBrowserId = 0;
+
+class BrowserPool {
+    constructor() {
+        this.browsers = new Map();
+        this.available = [];
+        this.inUse = new Set();
+        this.maxBrowsers = MAX_BROWSER_INSTANCES;
+        this.cleanupInterval = null;
+        this.startCleanupTimer();
+    }
+
+    startCleanupTimer() {
+        // Clean up idle browsers every 5 minutes
+        this.cleanupInterval = setInterval(() => {
+            this.cleanupIdleBrowsers();
+        }, 5 * 60 * 1000);
+    }
+
+    async getBrowser() {
+        // Check if we have available browsers
+        if (this.available.length > 0) {
+            const browserId = this.available.pop();
+            this.inUse.add(browserId);
+            const browser = this.browsers.get(browserId);
+            console.log(`Reusing browser ${browserId} from pool (${this.available.length} available)`);
+            return { browser, browserId };
+        }
+
+        // Create new browser if under limit
+        if (this.browsers.size < this.maxBrowsers) {
+            const browserId = `browser_${++nextBrowserId}`;
+            const browser = await this.createOptimizedBrowser();
+            this.browsers.set(browserId, browser);
+            this.inUse.add(browserId);
+            console.log(`Created new browser ${browserId} (${this.browsers.size}/${this.maxBrowsers})`);
+            return { browser, browserId };
+        }
+
+        // Wait for available browser (with timeout)
+        console.log('Browser pool full, waiting for available browser...');
+        return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                reject(new Error('Browser pool timeout - all browsers busy'));
+            }, 30000);
+
+            const checkAvailable = setInterval(() => {
+                if (this.available.length > 0) {
+                    clearTimeout(timeout);
+                    clearInterval(checkAvailable);
+                    const browserId = this.available.pop();
+                    this.inUse.add(browserId);
+                    const browser = this.browsers.get(browserId);
+                    console.log(`Got waiting browser ${browserId} from pool`);
+                    resolve({ browser, browserId });
+                }
+            }, 100);
+        });
+    }
+
+    releaseBrowser(browserId) {
+        if (this.inUse.has(browserId)) {
+            this.inUse.delete(browserId);
+            this.available.push(browserId);
+            console.log(`Released browser ${browserId} to pool (${this.available.length} available)`);
+        }
+    }
+
+    async createOptimizedBrowser() {
+        return await puppeteer.launch({
+            headless: true,
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas',
+                '--no-first-run',
+                '--no-zygote',
+                '--disable-gpu',
+                '--disable-web-security',
+                '--disable-features=VizDisplayCompositor',
+                '--autoplay-policy=no-user-gesture-required',
+                '--allow-running-insecure-content',
+                '--use-fake-ui-for-media-stream',
+                '--use-fake-device-for-media-stream',
+                '--enable-experimental-web-platform-features',
+                '--enable-features=MediaStreamTrackTransfer',
+                '--allow-file-access-from-files',
+                '--disable-background-timer-throttling',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-renderer-backgrounding',
+                '--enable-features=VaapiVideoDecoder',
+                '--memory-pressure-off',
+                '--max_old_space_size=512',
+                '--aggressive-cache-discard',
+                '--lang=en',
+                '--accept-lang=en'
+            ],
+            defaultViewport: { width: 1366, height: 768 }, // Reduced from 1920x1080 for efficiency
+            protocolTimeout: 60000
+        });
+    }
+
+    async cleanupIdleBrowsers() {
+        console.log(`Browser pool cleanup: ${this.available.length} available, ${this.inUse.size} in use`);
+        
+        // Keep at least 1 browser in pool, close excess idle browsers
+        while (this.available.length > 1) {
+            const browserId = this.available.shift();
+            const browser = this.browsers.get(browserId);
+            if (browser) {
+                try {
+                    await browser.close();
+                    this.browsers.delete(browserId);
+                    console.log(`Cleaned up idle browser ${browserId}`);
+                } catch (error) {
+                    console.log(`Error cleaning up browser ${browserId}:`, error.message);
+                }
+            }
+        }
+    }
+
+    async cleanup() {
+        if (this.cleanupInterval) {
+            clearInterval(this.cleanupInterval);
+        }
+        
+        for (const [browserId, browser] of this.browsers) {
+            try {
+                await browser.close();
+                console.log(`Closed browser ${browserId} during shutdown`);
+            } catch (error) {
+                console.log(`Error closing browser ${browserId}:`, error.message);
+            }
+        }
+        
+        this.browsers.clear();
+        this.available.length = 0;
+        this.inUse.clear();
+    }
+}
+
+const browserPool = new BrowserPool();
+
+// Resource monitoring and limits
+class ResourceMonitor {
+    constructor() {
+        this.startMonitoring();
+    }
+
+    startMonitoring() {
+        // Monitor every 30 seconds
+        setInterval(() => {
+            this.checkResources();
+        }, 30000);
+    }
+
+    checkResources() {
+        const memUsage = process.memoryUsage();
+        const memMB = Math.round(memUsage.heapUsed / 1024 / 1024);
+        const totalMemMB = Math.round(memUsage.rss / 1024 / 1024);
+        
+        console.log(`Resource check: ${activeBots.size}/${MAX_CONCURRENT_BOTS} bots, ${memMB}MB heap, ${totalMemMB}MB total`);
+        
+        // Memory pressure handling
+        if (totalMemMB > MEMORY_LIMIT_MB * 0.8) {
+            console.log(`High memory usage detected: ${totalMemMB}MB > ${MEMORY_LIMIT_MB * 0.8}MB threshold`);
+            this.handleMemoryPressure();
+        }
+        
+        // Record metrics
+        redis.recordMetric('worker_memory_usage', totalMemMB, {
+            active_bots: activeBots.size,
+            heap_used: memMB
+        });
+    }
+
+    async handleMemoryPressure() {
+        console.log('Handling memory pressure...');
+        
+        // Force garbage collection if available
+        if (global.gc) {
+            global.gc();
+            console.log('Forced garbage collection');
+        }
+        
+        // Clean up old bots that may be stuck
+        const cutoffTime = Date.now() - (30 * 60 * 1000); // 30 minutes
+        let cleanedCount = 0;
+        
+        for (const [meetingId, bot] of activeBots.entries()) {
+            if (bot.startTime.getTime() < cutoffTime) {
+                console.log(`Cleaning up old bot ${meetingId} due to memory pressure`);
+                try {
+                    await bot.cleanup();
+                    activeBots.delete(meetingId);
+                    cleanedCount++;
+                } catch (error) {
+                    console.log(`Error cleaning up bot ${meetingId}:`, error.message);
+                }
+            }
+        }
+        
+        console.log(`Cleaned up ${cleanedCount} old bots due to memory pressure`);
+    }
+
+    canCreateNewBot() {
+        const memUsage = process.memoryUsage();
+        const totalMemMB = Math.round(memUsage.rss / 1024 / 1024);
+        
+        if (activeBots.size >= MAX_CONCURRENT_BOTS) {
+            console.log(`Bot limit reached: ${activeBots.size}/${MAX_CONCURRENT_BOTS}`);
+            return { allowed: false, reason: 'concurrent_limit' };
+        }
+        
+        if (totalMemMB > MEMORY_LIMIT_MB * 0.9) {
+            console.log(`Memory limit reached: ${totalMemMB}MB > ${MEMORY_LIMIT_MB * 0.9}MB`);
+            return { allowed: false, reason: 'memory_limit' };
+        }
+        
+        return { allowed: true };
+    }
+}
+
+const resourceMonitor = new ResourceMonitor();
+
 if (!fs.existsSync(RECORDINGS_DIR)) {
     fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
 }
@@ -247,12 +478,21 @@ function parseZoomMeetingInfo(input) {
             if (numberMatch) {
                 meetingId = numberMatch[0];
                 console.log(`Using meeting ID: ${meetingId}, Password: ${finalPassword ? 'YES' : 'NO'}`);
+            } else if (input.trim().length > 0) {
+                // Flexible fallback - use input as-is
+                meetingId = input.trim();
+                console.log(`Using flexible meeting ID from URL error: ${meetingId}`);
             }
         }
     } else if (typeof input === 'string') {
+        // First try strict 9-11 digit format
         const numberMatch = input.match(/\d{9,11}/);
         if (numberMatch) {
             meetingId = numberMatch[0];
+        } else if (input.trim().length > 0) {
+            // Accept any non-empty string as meeting ID (more flexible)
+            meetingId = input.trim();
+            console.log(`Using flexible meeting ID: ${meetingId}`);
         }
     }
 
@@ -305,8 +545,10 @@ class BotManager {
         this.userId = userId;
         this.status = 'initializing';
         console.log(`BotManager constructor - meetingId: ${meetingId}, userId: ${userId}, userId type: ${typeof userId}`);
+        console.log(`BotManager userId validation: isObjectId=${typeof userId === 'string' && userId.match(/^[0-9a-fA-F]{24}$/)}, length=${userId?.length}`);
         this.startTime = new Date();
         this.browser = null;
+        this.browserId = null;
         this.page = null;
         this.mediaRecorder = null;
         this.recordedChunks = [];
@@ -317,6 +559,8 @@ class BotManager {
         this.endDetectionInterval = null;
         this.uploadAttempted = false;
         this.transcriptionAttempted = false;
+        this.shouldStop = false;  // Flag to signal immediate stop
+        this.stopReason = '';     // Reason for stopping
     }
 
     async updateStatus(status, details = {}) {
@@ -340,6 +584,46 @@ class BotManager {
         });
 
         console.log(`Bot ${this.meetingId}: ${status}`, details);
+    }
+
+    // Signal the bot to stop immediately
+    signalStop(reason = 'User requested stop') {
+        console.log(`Bot ${this.meetingId}: Stop signal received - ${reason}`);
+        this.shouldStop = true;
+        this.stopReason = reason;
+        
+        // Stop synthetic audio generation if active
+        if (this.page) {
+            this.page.evaluate(() => {
+                // Set stop flag to prevent new synthetic audio creation
+                window.botShouldStop = true;
+                
+                // Stop existing recording
+                if (window.mediaRecorder && window.mediaRecorder.state === 'recording') {
+                    console.log('Stopping synthetic audio recording due to stop signal');
+                    window.mediaRecorder.stop();
+                }
+                if (window.recordingStream) {
+                    window.recordingStream.getTracks().forEach(track => track.stop());
+                }
+            }).catch(err => console.log('Error stopping synthetic audio:', err.message));
+        }
+    }
+
+    // Check if bot should stop
+    shouldStopRecording() {
+        if (this.shouldStop) {
+            console.log(`Bot ${this.meetingId}: Stopping due to: ${this.stopReason}`);
+            return true;
+        }
+        
+        // Also check if meeting is in failed/ended states
+        if (['failed', 'ended', 'cleaned_up'].includes(this.status)) {
+            console.log(`Bot ${this.meetingId}: Stopping due to status: ${this.status}`);
+            return true;
+        }
+        
+        return false;
     }
 
     async startRecording() {
@@ -485,7 +769,7 @@ class BotManager {
                         
                         // Try multiple times to find streams (Zoom loads them asynchronously)
                         let attempts = 0;
-                        const maxAttempts = 15; // Increased attempts
+                        const maxAttempts = 20; // Increased attempts for better success rate
                         
                         function attemptCapture() {
                             attempts++;
@@ -541,9 +825,23 @@ class BotManager {
                             }
                             
                             if (attempts < maxAttempts) {
+                                // Check if bot should stop before retrying
+                                if (window.botShouldStop) {
+                                    console.log(' Bot stop signal detected during audio retry, aborting');
+                                    resolve({ success: false, error: 'Bot stop signal received' });
+                                    return;
+                                }
+                                
                                 console.log(`⏳ No audio streams found yet, retrying in 3 seconds... (${attempts}/${maxAttempts})`);
                                 setTimeout(attemptCapture, 3000); // Increased wait time
                             } else {
+                                // Check if bot should stop before creating synthetic audio
+                                if (window.botShouldStop) {
+                                    console.log(' Bot stop signal detected, aborting synthetic audio creation');
+                                    resolve({ success: false, error: 'Bot stop signal received' });
+                                    return;
+                                }
+                                
                                 console.log(' Max attempts reached, creating minimal synthetic audio for transcription');
                                 
                                 // Create a very minimal synthetic audio stream for transcription
@@ -570,6 +868,15 @@ class BotManager {
                                         });
                                         
                                         window.mediaRecorder.ondataavailable = (event) => {
+                                            // Check for stop signal before processing chunks
+                                            if (window.botShouldStop) {
+                                                console.log(' Stop signal detected, terminating synthetic audio');
+                                                if (window.mediaRecorder && window.mediaRecorder.state === 'recording') {
+                                                    window.mediaRecorder.stop();
+                                                }
+                                                return;
+                                            }
+                                            
                                             if (event.data.size > 0) {
                                                 window.recordedChunks.push(event.data);
                                             console.log(` Synthetic audio chunk: ${event.data.size} bytes (FALLBACK)`);
@@ -1203,8 +1510,43 @@ class BotManager {
             const stats = fs.statSync(this.recordingPath);
             let userIdForBackend = this.userId;
             
-            if (typeof this.userId === 'string' && this.userId.match(/^[0-9a-fA-F]{24}$/)) {
-                userIdForBackend = this.userId;
+            // Check if userId is a MongoDB ObjectId (24 hex characters)
+            const isObjectId = typeof this.userId === 'string' && this.userId.match(/^[0-9a-fA-F]{24}$/);
+            
+            console.log(`USERID VALIDATION: userId="${this.userId}", isObjectId=${isObjectId}, type=${typeof this.userId}`);
+            
+            if (!isObjectId) {
+                // This is likely a Zoom hostId, need to get proper MongoDB userId from backend
+                console.log(`INVALID USERID: "${this.userId}" is not a MongoDB ObjectId, fetching proper userId from backend...`);
+                
+                try {
+                    const secretKey = process.env.VPS_SECRET || process.env.MAIN_SERVER_SECRET || '1234';
+                    const baseUrl = MAIN_SERVER_URL.replace(/\/api$/, '');
+                    const userLookupUrl = `${baseUrl}/api/maintenance/get-user-by-zoom-id/${this.userId}`;
+                    
+                    const userResponse = await fetch(userLookupUrl, {
+                        headers: {
+                            'x-admin-secret': secretKey
+                        }
+                    });
+                    
+                    if (userResponse.ok) {
+                        const userData = await userResponse.json();
+                        if (userData.userId) {
+                            userIdForBackend = userData.userId;
+                            console.log(`USER LOOKUP SUCCESS: Found MongoDB userId "${userIdForBackend}" for Zoom hostId "${this.userId}"`);
+                        } else {
+                            console.error(`USER LOOKUP FAILED: No userId found for Zoom hostId "${this.userId}"`);
+                            return { success: false, error: `Cannot find MongoDB user for Zoom hostId: ${this.userId}` };
+                        }
+                    } else {
+                        console.error(`USER LOOKUP API FAILED: ${userResponse.status} - ${await userResponse.text()}`);
+                        return { success: false, error: `User lookup failed for hostId: ${this.userId}` };
+                    }
+                } catch (lookupError) {
+                    console.error(`USER LOOKUP ERROR: ${lookupError.message}`);
+                    return { success: false, error: `User lookup error: ${lookupError.message}` };
+                }
             }
             
             const payload = {
@@ -1262,7 +1604,7 @@ class BotManager {
                     'the host has ended this meeting for everyone'
                 ];
                 
-                const bodyText = document.body.textContent.toLowerCase();
+                const bodyText = document.body?.textContent?.toLowerCase() || '';
                 const meetingEnded = endIndicators.some(indicator => bodyText.includes(indicator));
                 
                 // Check for critical meeting UI elements that indicate an active meeting
@@ -1317,6 +1659,9 @@ class BotManager {
                 console.log(` Meeting ${this.meetingId} has DEFINITELY ended - stopping recording`);
                 console.log(`Page title: ${meetingStatus.pageTitle}`);
                 console.log(` Current URL: ${meetingStatus.currentUrl}`);
+                
+                // Signal stop to prevent synthetic audio generation
+                this.signalStop('Meeting ended - triple confirmation');
                 
                 await sendWebhook('meeting.ended', {
                     meetingId: this.meetingId,
@@ -1516,6 +1861,9 @@ class BotManager {
     async cleanup() {
         console.log(`Cleaning up bot ${this.meetingId}`);
         
+        // Signal stop to prevent synthetic audio generation
+        this.signalStop('Bot cleanup initiated');
+        
         if (this.saveInterval) {
             clearInterval(this.saveInterval);
             this.saveInterval = null;
@@ -1530,8 +1878,26 @@ class BotManager {
             await this.stopRecording(false);
         }
         
-        if (this.page) await this.page.close();
-        if (this.browser) await this.browser.close();
+        try {
+            // Close the page but reuse the browser
+            if (this.page) {
+                await this.page.close();
+                this.page = null;
+            }
+            
+            // Return browser to pool instead of closing it
+            if (this.browserId) {
+                browserPool.releaseBrowser(this.browserId);
+                this.browser = null;
+                this.browserId = null;
+            } else if (this.browser) {
+                // Fallback for old browsers not from pool
+                await this.browser.close();
+                this.browser = null;
+            }
+        } catch (error) {
+            console.log(`Error during browser cleanup: ${error.message}`);
+        }
         
         await sendWebhook('bot.cleanup', {
             meetingId: this.meetingId,
@@ -1561,6 +1927,8 @@ async function createBrowser() {
             '--allow-running-insecure-content',
             '--use-fake-ui-for-media-stream',
             '--use-fake-device-for-media-stream',
+            '--enable-experimental-web-platform-features',
+            '--enable-features=MediaStreamTrackTransfer',
             '--allow-file-access-from-files',
             '--disable-background-timer-throttling',
             '--disable-backgrounding-occluded-windows',
@@ -1584,25 +1952,58 @@ async function joinMeeting(meetingIdOrUrl, password = '', userId = 'bot') {
         throw new Error('Invalid meeting ID or URL');
     }
 
+    // Use provided password if URL parsing didn't find one
+    const finalPassword = parsedUrl.password || password;
+    console.log(`Password resolution: ${finalPassword ? 'PROVIDED' : 'NONE'}`);
+
     if (activeBots.has(meetingId)) {
         throw new Error(`Bot already exists for meeting ${meetingId}`);
     }
 
+    // Check resource limits before creating new bot
+    const resourceCheck = resourceMonitor.canCreateNewBot();
+    if (!resourceCheck.allowed) {
+        const errorMsg = resourceCheck.reason === 'concurrent_limit' 
+            ? `Maximum concurrent bots limit reached (${MAX_CONCURRENT_BOTS})`
+            : `Memory limit reached (${MEMORY_LIMIT_MB}MB)`;
+        console.log(`Bot creation denied: ${errorMsg}`);
+        throw new Error(errorMsg);
+    }
+
+    console.log(`CREATING BOT: meetingId="${meetingId}", userId="${userId}", userIdType=${typeof userId}`);
     const botManager = new BotManager(meetingId, userId);
     activeBots.set(meetingId, botManager);
 
     try {
-        console.log(`Starting bot for meeting ${meetingId} on domain ${parsedUrl.domain}`);
+        console.log(`Starting bot for meeting ${meetingId} on domain ${parsedUrl.domain} (${activeBots.size}/${MAX_CONCURRENT_BOTS} active)`);
         
-        botManager.browser = await createBrowser();
-        botManager.page = await botManager.browser.newPage();
+        // Get browser from pool
+        const { browser, browserId } = await browserPool.getBrowser();
+        botManager.browser = browser;
+        botManager.browserId = browserId;
+        botManager.page = await browser.newPage();
 
         // Set a real browser user agent
         await botManager.page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
-        // Disable webdriver detection
+        // Optimize page for performance
+        await botManager.page.setRequestInterception(true);
+        botManager.page.on('request', (request) => {
+            const resourceType = request.resourceType();
+            // Block unnecessary resources to save bandwidth and memory
+            if (['image', 'stylesheet', 'font', 'media'].includes(resourceType)) {
+                request.abort();
+            } else {
+                request.continue();
+            }
+        });
+
+        // Disable webdriver detection and optimize
         await botManager.page.evaluateOnNewDocument(() => {
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            // Optimize performance
+            window.performance.mark = () => {};
+            window.performance.measure = () => {};
         });
 
         botManager.page.on('console', msg => {
@@ -1616,7 +2017,7 @@ async function joinMeeting(meetingIdOrUrl, password = '', userId = 'bot') {
                 text.includes('meeting has ended') ||
                 text.includes('you have been removed from the meeting')) {
                 
-                console.log(`🚨 Meeting end detected via console for ${meetingId}: ${text}`);
+                console.log(`Meeting end detected via console for ${meetingId}: ${text}`);
                 
                 // Trigger webhook with delay to ensure all logs are captured
                 setTimeout(async () => {
@@ -1648,6 +2049,7 @@ async function joinMeeting(meetingIdOrUrl, password = '', userId = 'bot') {
 
         botManager.page.on('pageerror', error => {
             console.log(`Page error [${meetingId}]:`, error.message);
+            console.log(`Page error stack [${meetingId}]:`, error.stack);
         });
 
         await botManager.updateStatus('navigating');
@@ -1692,13 +2094,14 @@ async function joinMeeting(meetingIdOrUrl, password = '', userId = 'bot') {
                  ariaLabel: button.getAttribute('aria-label')
              }));
              
-             return { inputs, buttons, bodyText: document.body.textContent.substring(0, 200) };
+             return { inputs, buttons, bodyText: (document.body?.textContent || '').substring(0, 200) };
          });
          
          console.log('Page elements found:', JSON.stringify(pageDebug, null, 2));
 
          // Fill name field
          const nameSelectors = [
+            '#input-for-name',  // CRITICAL: This is the actual selector we need!
              '.webclient-name-input',
              'input[placeholder*="name" i]',
              'input[aria-label*="name" i]',
@@ -1729,26 +2132,36 @@ async function joinMeeting(meetingIdOrUrl, password = '', userId = 'bot') {
         }
 
         // Fill password field if needed
-        if (parsedUrl.password || password) {
+        console.log(`Using password: ${finalPassword ? 'YES' : 'NO'}`);
+        
+        if (finalPassword) {
+            console.log('Attempting to fill password field');
             const passwordSelectors = [
+                '#input-for-pwd',
                 '.webclient-password-input',
                 'input[type="password"]',
                 'input[placeholder*="password" i]',
                 '#inputpasscode'
             ];
 
+            let passwordEntered = false;
             for (const selector of passwordSelectors) {
                 try {
                     await botManager.page.waitForSelector(selector, { timeout: 2000 });
-                    await botManager.page.type(selector, parsedUrl.password || password);
+                    await botManager.page.type(selector, finalPassword);
                     console.log(`Password entered using selector: ${selector}`);
+                    passwordEntered = true;
                     break;
                 } catch (error) {
                     console.log(`Password selector failed: ${selector}`);
                 }
             }
+            
+            if (!passwordEntered) {
+                console.log('No password field found on page despite password being provided');
+            }
         } else {
-            console.log('Password required but no password field found');
+            console.log('No password provided - proceeding without password');
         }
 
                  // Click join button
@@ -1813,7 +2226,7 @@ async function joinMeeting(meetingIdOrUrl, password = '', userId = 'bot') {
             console.log('Checking for post-join prompts...');
             
             // Handle post-join password if needed
-            if (parsedUrl.password || password) {
+            if (finalPassword) {
                 const postJoinPasswordSelectors = [
                     '.webclient-password-input',
                     'input[type="password"]',
@@ -1824,7 +2237,7 @@ async function joinMeeting(meetingIdOrUrl, password = '', userId = 'bot') {
                 for (const pwSelector of postJoinPasswordSelectors) {
                     try {
                         await botManager.page.waitForSelector(pwSelector, { timeout: 3000 });
-                        await botManager.page.type(pwSelector, parsedUrl.password || password);
+                        await botManager.page.type(pwSelector, finalPassword);
                         console.log(`Post-join password entered using: ${pwSelector}`);
                         
                                                  const submitSelectors = [
@@ -1950,8 +2363,8 @@ async function joinMeeting(meetingIdOrUrl, password = '', userId = 'bot') {
                 await botManager.updateStatus('joined');
                 
                 // Wait longer for meeting audio streams to properly initialize
-                console.log('⏳ Waiting 8 seconds for meeting audio streams to fully initialize...');
-                await new Promise(resolve => setTimeout(resolve, 8000));
+                console.log('⏳ Waiting 15 seconds for meeting audio streams to fully initialize...');
+                await new Promise(resolve => setTimeout(resolve, 15000));
                 
                 // Start recording
                 const recordingStarted = await botManager.startRecording();
@@ -2029,14 +2442,37 @@ app.get('/health', (req, res) => {
 app.get('/health/detailed', async (req, res) => {
     try {
         const memUsage = process.memoryUsage();
+        const memMB = Math.round(memUsage.rss / 1024 / 1024);
+        const heapMB = Math.round(memUsage.heapUsed / 1024 / 1024);
+        
         res.json({
             status: 'healthy',
             timestamp: new Date().toISOString(),
             redis: redis.status,
-            activeBots: activeBots.size,
+            performance: {
+                activeBots: activeBots.size,
+                maxConcurrentBots: MAX_CONCURRENT_BOTS,
+                concurrencyUsage: `${Math.round(activeBots.size / MAX_CONCURRENT_BOTS * 100)}%`,
+                browserPool: {
+                    available: browserPool.available.length,
+                    inUse: browserPool.inUse.size,
+                    total: browserPool.browsers.size,
+                    maxBrowsers: MAX_BROWSER_INSTANCES,
+                    efficiency: `${Math.round((browserPool.inUse.size + browserPool.available.length) / activeBots.size * 100) || 0}%`
+                }
+            },
             memory: {
-                rss: memUsage.rss / 1024 / 1024,
-                heapUsed: memUsage.heapUsed / 1024 / 1024
+                rss: memMB,
+                heapUsed: heapMB,
+                heapTotal: Math.round(memUsage.heapTotal / 1024 / 1024),
+                limit: MEMORY_LIMIT_MB,
+                usage: `${Math.round(memMB / MEMORY_LIMIT_MB * 100)}%`,
+                pressure: memMB > MEMORY_LIMIT_MB * 0.8
+            },
+            resources: {
+                canCreateBot: resourceMonitor.canCreateNewBot().allowed,
+                memoryPressure: memMB > MEMORY_LIMIT_MB * 0.8,
+                cpuUsage: process.cpuUsage()
             },
             uptime: process.uptime()
         });
@@ -2048,6 +2484,87 @@ app.get('/health/detailed', async (req, res) => {
     }
 });
 
+// PRIMARY METHOD: Automatic bot joining when meeting starts (via webhook)
+app.post('/auto-join-meeting', protectEndpoint, async (req, res) => {
+    try {
+        const { meetingId, hostId, userId, password, topic } = req.body;
+        
+        if (!meetingId) {
+            return res.status(400).json({ error: 'meetingId is required' });
+        }
+
+        if (!hostId) {
+            return res.status(400).json({ error: 'hostId is required for auto-join' });
+        }
+
+        console.log(`AUTO-JOIN: Meeting ${meetingId} started by host ${hostId}`);
+        console.log(`FULL REQUEST BODY:`, JSON.stringify(req.body, null, 2));
+        console.log(`Meeting details:`, { meetingId, hostId, userId: userId || 'MISSING', topic: topic || 'Unknown', password: password ? 'PROVIDED' : 'NONE' });
+        console.log(`USER ID DEBUG: received="${userId}", type=${typeof userId}, isObjectId=${typeof userId === 'string' && userId.length === 24}`);
+        
+        // Check if bot is already active for this meeting
+        if (activeBots.has(meetingId)) {
+            console.log(` Bot already active for meeting ${meetingId}`);
+            return res.json({
+                success: true,
+                message: 'Bot already active for this meeting',
+                meetingId,
+                status: 'already_active'
+            });
+        }
+
+        // Auto-join the meeting using proper userId for database operations
+        const finalUserId = userId || hostId;
+        console.log(`USERID SELECTION: userId="${userId}", hostId="${hostId}", selected="${finalUserId}"`);
+        const result = await joinMeeting(meetingId, password || '', finalUserId);
+        
+        if (result.success) {
+            console.log('AUTO-JOIN successful:', result);
+            res.status(202).json({
+                success: true,
+                message: 'Bot auto-joined meeting successfully',
+                method: 'automatic_webhook',
+                performance: {
+                    activeBots: activeBots.size,
+                    maxConcurrentBots: MAX_CONCURRENT_BOTS
+                },
+                ...result
+            });
+        } else {
+            console.error('AUTO-JOIN failed:', result.error);
+            
+            // Determine appropriate status code based on error type
+            let statusCode = 500;
+            if (result.error.includes('limit reached') || result.error.includes('Memory limit')) {
+                statusCode = 503; // Service Unavailable
+            } else if (result.error.includes('already exists')) {
+                statusCode = 409; // Conflict
+            }
+            
+            res.status(statusCode).json({
+                success: false,
+                error: result.error,
+                message: 'Failed to auto-join meeting',
+                method: 'automatic_webhook',
+                performance: {
+                    activeBots: activeBots.size,
+                    maxConcurrentBots: MAX_CONCURRENT_BOTS,
+                    resourceLimited: statusCode === 503
+                }
+            });
+        }
+    } catch (error) {
+        console.error('Auto-join error:', error.message);
+        res.status(500).json({ 
+            success: false, 
+            error: error.message,
+            method: 'automatic_webhook'
+        });
+    }
+});
+
+
+// SECONDARY METHOD: Manual bot launching (backup/optional)
 app.post('/launch-bot', protectEndpoint, async (req, res) => {
     try {
         const { meetingId, password, userId } = req.body;
@@ -2060,30 +2577,45 @@ app.post('/launch-bot', protectEndpoint, async (req, res) => {
             return res.status(400).json({ error: 'userId is required' });
         }
 
-        console.log(`Launching bot for meeting ${meetingId} with userId: ${userId} (type: ${typeof userId})`);
-        console.log(`Full request body:`, JSON.stringify(req.body, null, 2));
+        console.log(` MANUAL-JOIN: User ${userId} manually launching bot for meeting ${meetingId}`);
+        console.log(` Request details:`, JSON.stringify(req.body, null, 2));
+        
+        // Check if bot is already active
+        if (activeBots.has(meetingId)) {
+            console.log(` Bot already active for meeting ${meetingId}`);
+            return res.json({
+                success: true,
+                message: 'Bot already active for this meeting',
+                meetingId,
+                status: 'already_active'
+            });
+        }
+
         const result = await joinMeeting(meetingId, password, userId);
         
                  if (result.success) {
-             console.log('Bot join completed:', result);
+            console.log('MANUAL-JOIN successful:', result);
              res.status(202).json({
                  success: true,
                  message: 'Bot launched successfully',
+                method: 'manual_invitation',
                  ...result
              });
          } else {
-             console.error('Bot join failed:', result.error);
+            console.error('MANUAL-JOIN failed:', result.error);
              res.status(500).json({
                  success: false,
                  error: result.error,
-                 message: 'Failed to launch bot'
+                message: 'Failed to launch bot',
+                method: 'manual_invitation'
              });
          }
     } catch (error) {
-        console.error('Bot launch error:', error.message);
+        console.error('Manual bot launch error:', error.message);
         res.status(500).json({ 
             success: false, 
-            error: error.message 
+            error: error.message,
+            method: 'manual_invitation'
         });
     }
 });
@@ -2194,6 +2726,14 @@ app.post('/webhook/bot-command', async (req, res) => {
 
         console.log(`Webhook: Bot command ${command} for meeting ${meetingId}`);
         
+        // Handle stop command immediately to prevent synthetic audio
+        if (command.toLowerCase() === 'stop') {
+            const bot = activeBots.get(meetingId);
+            if (bot) {
+                bot.signalStop('Webhook stop command');
+            }
+        }
+        
         // Publish to Redis for processing
         if (redis.publisher) {
             await redis.publisher.publish('bot_commands', JSON.stringify({ meetingId, command }));
@@ -2206,18 +2746,113 @@ app.post('/webhook/bot-command', async (req, res) => {
     }
 });
 
+// Manual stop bot endpoint for immediate termination
+app.post('/stop-bot/:meetingId', protectEndpoint, async (req, res) => {
+    try {
+        const { meetingId } = req.params;
+        const { reason = 'Manual stop request' } = req.body;
+        
+        console.log(`Manual stop bot requested for meeting ${meetingId}, reason: ${reason}`);
+        
+        const bot = activeBots.get(meetingId);
+        if (!bot) {
+            return res.status(404).json({ 
+                success: false,
+                error: 'Bot not found or not active',
+                meetingId 
+            });
+        }
+
+        // Signal immediate stop to prevent synthetic audio generation
+        bot.signalStop(reason);
+        
+        // Give a moment for stop signal to propagate
+        setTimeout(async () => {
+            try {
+                if (bot.status === 'recording') {
+                    await bot.stopRecording();
+                }
+                await bot.cleanup();
+                activeBots.delete(meetingId);
+                console.log(`Bot ${meetingId} successfully stopped and cleaned up`);
+            } catch (stopError) {
+                console.log(`Error during delayed bot cleanup: ${stopError.message}`);
+            }
+        }, 1000);
+
+        res.json({
+            success: true,
+            message: `Bot stop signal sent for meeting ${meetingId}`,
+            meetingId,
+            reason,
+            stoppedAt: new Date().toISOString(),
+            note: 'Bot will stop synthetic audio immediately and cleanup in 1 second'
+        });
+    } catch (error) {
+        console.error('Manual stop bot error:', error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Graceful shutdown handling
+process.on('SIGTERM', async () => {
+    console.log('SIGTERM received, shutting down gracefully...');
+    await gracefulShutdown();
+    process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+    console.log('SIGINT received, shutting down gracefully...');
+    await gracefulShutdown();
+    process.exit(0);
+});
+
+async function gracefulShutdown() {
+    try {
+        console.log('Starting graceful shutdown...');
+        
+        // Stop accepting new requests
+        console.log('Cleaning up active bots...');
+        for (const [meetingId, bot] of activeBots.entries()) {
+            try {
+                await bot.cleanup();
+                activeBots.delete(meetingId);
+            } catch (error) {
+                console.log(`Error cleaning up bot ${meetingId}:`, error.message);
+            }
+        }
+        
+        // Clean up browser pool
+        console.log('Cleaning up browser pool...');
+        await browserPool.cleanup();
+        
+        // Close Redis connections
+        console.log('Closing Redis connections...');
+        await redis.close();
+        
+        console.log('Graceful shutdown completed');
+    } catch (error) {
+        console.error('Error during graceful shutdown:', error.message);
+    }
+}
+
 app.listen(PORT, "0.0.0.0", () => {
-    console.log(`High-Performance Zoom Bot Worker listening on port ${PORT}`);
-    console.log(`Redis cluster status: ${redis.status}`);
-    console.log(`Recordings directory: ${RECORDINGS_DIR}`);
-    console.log(`Performance monitoring: Active`);
+    console.log(` High-Performance Zoom Bot Worker listening on port ${PORT}`);
+    console.log(` Performance Limits: ${MAX_CONCURRENT_BOTS} bots, ${MAX_BROWSER_INSTANCES} browsers, ${MEMORY_LIMIT_MB}MB memory`);
+    console.log(` Redis cluster status: ${redis.status}`);
+    console.log(` Recordings directory: ${RECORDINGS_DIR}`);
+    console.log(` Performance monitoring: Active`);
+    console.log(` Bot Joining Methods:`);
+    console.log(`    PRIMARY: /auto-join-meeting (webhook-triggered)`);
+    console.log(`    SECONDARY: /launch-bot (manual invitation)`);
+    console.log(`    MANUAL STOP: /stop-bot/:meetingId (immediate termination)`);
     console.log(`Webhook endpoints: /webhook/meeting-ended, /webhook/bot-command`);
     
     if (redis.status === 'connected') {
-        console.log(`Redis features: Caching, Pub/Sub, Metrics`);
+        console.log(` Redis features: Caching, Pub/Sub, Metrics`);
     } else {
         console.log(`Redis status: Using memory fallback`);
     }
     
-    console.log(`System ready for high-performance meeting processing`);
+    console.log(`System ready for high-efficiency multi-user meeting processing`);
 }); 

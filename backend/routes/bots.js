@@ -12,7 +12,6 @@ router.post('/join-by-link', async (req, res) => {
   try {
     console.log('Join-by-link request received:');
     console.log('Request body:', JSON.stringify(req.body, null, 2));
-    console.log('User ID:', req.user._id);
     
     const { invitationLink } = req.body;
     
@@ -22,6 +21,7 @@ router.post('/join-by-link', async (req, res) => {
     }
 
     console.log('Processing invitation link:', invitationLink);
+    console.log('User:', req.user.email);
 
     const result = await WebhookHandler.handleBotJoinByLink(
       invitationLink, 
